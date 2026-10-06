@@ -1,0 +1,132 @@
+#!/usr/bin/env node
+// webpin — ローカルで開いた Web ページ上から、直したい箇所をその場で指示する
+const path = require('path');
+const { execFileSync, spawn } = require('child_process');
+const fs = require('fs');
+const os = require('os');
+
+const project = require('../lib/project');
+const store = require('../lib/store');
+
+const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
+function usage() {
+  console.log([
+    'usage: webpin [dir] [--port N] [--no-open]',
+    '       webpin --live https://example.com   PHP を本番に任せる（以後記憶する）',
+    '       webpin --local                      ライブ中継をやめる',
+    '       webpin notes [--json] [--all]',
+    '       webpin show <id>',
+    '       webpin done <id>... [--note "..."]',
+    '       webpin clear'
+  ].join('\n'));
+  process.exit(1);
+}
+
+const argv = process.argv.slice(2);
+const flags = {};
+const rest = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === '--json' || a === '--all' || a === '--no-open' || a === '--local') flags[a.slice(2)] = true;
+  else if (a === '--port') flags.port = Number(argv[++i]);
+  else if (a === '--live') { flags.live = argv[++i]; if (!flags.live) usage(); }
+  else if (a === '--note') flags.note = argv[++i];
+  else if (a === '-h' || a === '--help') usage();
+  else rest.push(a);
+}
+
+const sub = ['notes', 'show', 'done', 'clear'].includes(rest[0]) ? rest.shift() : null;
+const root = project.rootOf(rest[0] ? path.resolve(rest[0]) : process.cwd());
+
+const MARK = { done: '- ', applied: '+ ', open: '* ' };
+
+function fmt(n) {
+  const head = (MARK[n.status] || '* ') + n.id + ' [' + n.kind + '] ' + (n.page || '');
+  const lines = [head];
+  if (n.comment) lines.push('    ' + n.comment);
+  if (n.text) lines.push('    text: ' + n.text.slice(0, 80));
+  if (n.selector) lines.push('    at:   ' + n.selector);
+  (n.candidates || []).slice(0, 3).forEach(c => {
+    lines.push('    src:  ' + c.file + ':' + c.line + '  (' + c.why + ')');
+  });
+  if (n.applied) lines.push('    適用: ' + n.applied.map(a => a.file + ':' + a.line).join(', '));
+  if (n.shot) lines.push('    shot: ' + path.join(store.shotsDir(root), n.shot));
+  return lines.join('\n');
+}
+
+if (sub === 'notes' || sub === 'show') {
+  let list = store.load(root);
+  if (sub === 'show') list = list.filter(n => String(n.id) === rest[0]);
+  else if (!flags.all) list = list.filter(n => n.status !== 'done');
+  if (sub === 'notes' && !flags.all) list.sort((a, b) => (a.status === 'applied') - (b.status === 'applied') || a.id - b.id);
+  if (flags.json || sub === 'show') {
+    const shots = store.shotsDir(root);
+    console.log(JSON.stringify({
+      project: root,
+      notes: list.map(n => Object.assign({}, n, n.shot ? { shotPath: path.join(shots, n.shot) } : {}))
+    }, null, 2));
+  } else {
+    console.log(list.length ? list.map(fmt).join('\n') : '指摘はありません');
+  }
+  process.exit(0);
+}
+
+if (sub === 'done') {
+  if (!rest.length) usage();
+  rest.forEach(id => {
+    console.log((store.done(root, id, flags.note) ? 'done ' : 'not found ') + id);
+  });
+  process.exit(0);
+}
+
+if (sub === 'clear') {
+  store.clearDone(root);
+  console.log('完了済みを削除しました');
+  process.exit(0);
+}
+
+// ---- ライブ中継先 ----
+// DB やセッションに依存する PHP ページは手元では動かないので、本番の応答を借りる。
+// 毎回打たなくて済むようプロジェクトごとに覚えておく
+const config = project.readConfig(root);
+let liveOrigin = config.live || null;
+if (flags.local) {
+  delete config.live;
+  project.writeConfig(root, config);
+  liveOrigin = null;
+} else if (flags.live) {
+  try {
+    liveOrigin = new URL(/^https?:\/\//.test(flags.live) ? flags.live : 'https://' + flags.live).origin;
+  } catch (e) {
+    console.error('--live の指定が URL として読めません: ' + flags.live);
+    process.exit(1);
+  }
+  config.live = liveOrigin;
+  project.writeConfig(root, config);
+}
+
+// ---- サーバ起動 ----
+const server = require('../lib/server');
+const port = flags.port || project.portOf(root);
+const started = server.start({ dir: root, port: port, live: liveOrigin });
+const url = 'http://127.0.0.1:' + port + '/';
+
+console.log(url + '  (' + root + ')');
+if (started.live) console.log('ライブ: ' + started.live + '  PHP と手元に無いファイルは本番から取ります（--local で解除）');
+else if (!started.hasPhp) console.log('php が無いので .php は表示できません');
+
+if (!flags['no-open']) {
+  const profile = path.join(os.homedir(), '.cache', 'webpin', 'chrome');
+  fs.mkdirSync(profile, { recursive: true });
+  if (fs.existsSync(CHROME)) {
+    // 既定プロファイルでは remote debugging が拒否されるので専用プロファイルで開く
+    spawn(CHROME, [
+      '--remote-debugging-port=' + (port + 2),
+      '--user-data-dir=' + profile,
+      '--no-first-run', '--no-default-browser-check', url
+    ], { stdio: 'ignore', detached: true }).unref();
+  } else {
+    execFileSync('open', [url]);
+  }
+}
